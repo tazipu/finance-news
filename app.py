@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-财经新闻聚合系统 - 按钮第二排右下角
+财经新闻聚合系统 - 带访问统计
 """
 import datetime
 import hashlib
@@ -29,10 +29,97 @@ try:
 except:
     CACHE_FILE = "/data/data/ru.iiec.pydroid3/news_cache.json"
 
+# 访问统计存储文件
+try:
+    STATS_FILE = os.path.join(os.environ.get('HOME', '/sdcard'), "visit_stats.json")
+except:
+    STATS_FILE = "/data/data/ru.iiec.pydroid3/visit_stats.json"
+
 MAX_NEWS = 500
 REQUEST_TIMEOUT = 10
 CACHE_EXPIRE_DAYS = 7
 AUTO_CLEAN_INTERVAL = 3600
+
+# ==================== 访问统计模块 ====================
+class VisitStats:
+    def __init__(self):
+        self.total_visits = 0
+        self.today_visits = 0
+        self.today_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        self.visitors = {}  # IP -> 最后访问时间
+        self.load_stats()
+    
+    def load_stats(self):
+        """加载统计数据"""
+        if os.path.exists(STATS_FILE):
+            try:
+                with open(STATS_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.total_visits = data.get('total_visits', 0)
+                    self.today_visits = data.get('today_visits', 0)
+                    self.today_date = data.get('today_date', datetime.datetime.now().strftime("%Y-%m-%d"))
+                    self.visitors = data.get('visitors', {})
+                logger.info(f"✅ 加载访问统计：总访问{self.total_visits}次，今日{self.today_visits}次")
+            except Exception as e:
+                logger.error(f"❌ 加载访问统计失败：{e}")
+    
+    def save_stats(self):
+        """保存统计数据"""
+        try:
+            data = {
+                'total_visits': self.total_visits,
+                'today_visits': self.today_visits,
+                'today_date': self.today_date,
+                'visitors': self.visitors,
+                'update_time': datetime.datetime.now().isoformat()
+            }
+            with open(STATS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"❌ 保存访问统计失败：{e}")
+    
+    def record_visit(self, client_ip):
+        """记录一次访问"""
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        
+        # 如果跨天了，重置今日计数
+        if today != self.today_date:
+            self.today_visits = 0
+            self.today_date = today
+            self.visitors = {}
+        
+        # 记录总访问
+        self.total_visits += 1
+        self.today_visits += 1
+        
+        # 记录独立访客（按IP）
+        if client_ip:
+            self.visitors[client_ip] = datetime.datetime.now().isoformat()
+        
+        self.save_stats()
+        return {
+            'total': self.total_visits,
+            'today': self.today_visits,
+            'unique': len(self.visitors)
+        }
+    
+    def get_stats(self):
+        """获取统计数据"""
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        if today != self.today_date:
+            return {
+                'total': self.total_visits,
+                'today': 0,
+                'unique': 0
+            }
+        return {
+            'total': self.total_visits,
+            'today': self.today_visits,
+            'unique': len(self.visitors)
+        }
+
+# 初始化访问统计
+visit_stats = VisitStats()
 
 # ==================== 新闻存储模块 ====================
 class NewsStorage:
@@ -494,6 +581,25 @@ HTML_TEMPLATE = """
             color: white;
         }
         
+        /* 访问统计 */
+        .visit-stats {
+            display: flex;
+            gap: 16px;
+            font-size: 11px;
+            color: rgba(255,255,255,0.85);
+            margin-top: 6px;
+            flex-wrap: wrap;
+        }
+        .visit-stats span {
+            background: rgba(255,255,255,0.15);
+            padding: 2px 10px;
+            border-radius: 10px;
+        }
+        .visit-stats .num {
+            font-weight: bold;
+            color: #fff;
+        }
+        
         .news-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -601,7 +707,15 @@ HTML_TEMPLATE = """
     <div id="toast" class="toast"></div>
     <div class="header">
         <h1>📈 财经科技新闻</h1>
-        <div class="stats">共 <span id="count">0</span> 条 <span class="update-time" id="updateTime"></span></div>
+        <div class="stats">
+            共 <span id="count">0</span> 条
+            <span class="update-time" id="updateTime"></span>
+        </div>
+        <div class="visit-stats">
+            <span>👀 总访问 <span class="num" id="totalVisits">0</span></span>
+            <span>📅 今日 <span class="num" id="todayVisits">0</span></span>
+            <span>👤 独立访客 <span class="num" id="uniqueVisits">0</span></span>
+        </div>
         <div class="api-info">📰 36氪 + 新浪财经</div>
     </div>
     
@@ -632,6 +746,18 @@ HTML_TEMPLATE = """
             setTimeout(() => {
                 toast.style.display = 'none';
             }, 2000);
+        }
+        
+        async function loadVisits() {
+            try {
+                const resp = await fetch('/api/visits');
+                const data = await resp.json();
+                document.getElementById('totalVisits').textContent = data.total;
+                document.getElementById('todayVisits').textContent = data.today;
+                document.getElementById('uniqueVisits').textContent = data.unique;
+            } catch(e) {
+                // 静默失败，不影响主要功能
+            }
         }
         
         function toggleNews(id) {
@@ -724,6 +850,7 @@ HTML_TEMPLATE = """
                     showToast('💡 没有新新闻');
                 }
                 await loadNews(currentType);
+                await loadVisits();
             } catch(e) {
                 showToast('❌ 刷新失败');
             } finally {
@@ -761,6 +888,7 @@ HTML_TEMPLATE = """
         });
         
         loadNews('all');
+        loadVisits();
         setInterval(refresh, 300000);
     </script>
 </body>
@@ -781,6 +909,11 @@ class HttpHandler(BaseHTTPRequestHandler):
         path = url_parse.path
         query = urllib.parse.parse_qs(url_parse.query)
 
+        # 记录访问（除了 /api/visits 和 /api/health 不记录，避免循环）
+        if path != '/api/visits' and path != '/api/health':
+            client_ip = self.client_address[0]
+            visit_stats.record_visit(client_ip)
+
         if path == '/':
             self.send_response(200)
             self.send_header("Content-Type", "text/html;charset=utf-8")
@@ -792,6 +925,8 @@ class HttpHandler(BaseHTTPRequestHandler):
             self._send_json(data)
         elif path == '/api/stats':
             self._send_json(storage.get_stats())
+        elif path == '/api/visits':
+            self._send_json(visit_stats.get_stats())
         elif path == '/api/health':
             self._send_json({"status": "ok", "time": datetime.datetime.now().isoformat()})
         else:
