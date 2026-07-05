@@ -837,6 +837,6 @@ if __name__ == '__main__':
     print("\n" + "=" * 60)
 
     socketserver.ThreadingTCPServer.allow_reuse_address = True
-port = int(os.environ.get('PORT', 5000))
-with socketserver.ThreadingTCPServer(("0.0.0.0", port), HttpHandler) as httpd:
-    httpd.serve_forever()
+    port = int(os.environ.get('PORT', 5000))
+    with socketserver.ThreadingTCPServer(("0.0.0.0", port), HttpHandler) as httpd:
+        httpd.serve_forever()
