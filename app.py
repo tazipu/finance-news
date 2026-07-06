@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-财经新闻聚合系统 - GitHub部署版
+财经新闻聚合系统 - GitHub部署版（自适应布局）
 数据源：东方财富 + 同花顺 + 富途牛牛 + 36氪 + 新浪
 功能：访问统计 + 自动清理 + 分类筛选
 """
@@ -25,7 +25,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==================== 路径配置 ====================
-# 获取脚本所在目录（兼容本地和Render）
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(SCRIPT_DIR, "news_cache.json")
 STATS_FILE = os.path.join(SCRIPT_DIR, "visit_stats.json")
@@ -90,7 +89,6 @@ class VisitStats:
             return {'total': self.total_visits, 'today': 0, 'unique': 0}
         return {'total': self.total_visits, 'today': self.today_visits, 'unique': len(self.visitors)}
 
-# 初始化访问统计
 visit_stats = VisitStats()
 
 # ==================== 新闻存储模块 ====================
@@ -249,12 +247,10 @@ class NewsStorage:
             'update_time': datetime.datetime.now().isoformat()
         }
 
-# ==================== 数据源（使用AkShare） ====================
+# ==================== 数据源 ====================
 
 def fetch_akshare_news():
-    """使用 AkShare 获取多个数据源的新闻"""
     all_news = []
-    
     try:
         import akshare as ak
     except ImportError:
@@ -272,13 +268,10 @@ def fetch_akshare_news():
         try:
             func = source['func']
             name = source['name']
-            
             df = func()
-            
             if df is None or df.empty:
                 logger.warning(f"⚠️ {name} 返回空数据")
                 continue
-            
             count = 0
             for _, row in df.iterrows():
                 title = None
@@ -339,20 +332,13 @@ def fetch_akshare_news():
                     'url': ''
                 })
                 count += 1
-            
             logger.info(f"✅ {name}：{count}条")
-            
         except Exception as e:
             logger.error(f"❌ {name} 失败：{e}")
-        
         time.sleep(0.3)
-    
     return all_news
 
-# ==================== 备用数据源 ====================
-
 def fetch_36kr_rss():
-    """36氪RSS"""
     news_list = []
     try:
         import xml.etree.ElementTree as ET
@@ -394,7 +380,6 @@ def fetch_36kr_rss():
     return news_list
 
 def fetch_sina_rss():
-    """新浪RSS"""
     news_list = []
     try:
         import xml.etree.ElementTree as ET
@@ -435,8 +420,7 @@ def fetch_sina_rss():
         logger.error(f"❌ 新浪RSS失败：{e}")
     return news_list
 
-def generate_mock_news(count=10) -> List[Dict]:
-    """生成模拟数据"""
+def generate_mock_news(count=10):
     news_list = []
     now = datetime.datetime.now()
     mock_templates = [
@@ -464,16 +448,13 @@ def generate_mock_news(count=10) -> List[Dict]:
     logger.info(f"✅ 生成 {len(news_list)} 条模拟数据")
     return news_list
 
-def fetch_all_news() -> List[Dict]:
-    """获取所有数据源"""
+def fetch_all_news():
     all_news = []
-    
     sources = [
         ('AkShare多源', fetch_akshare_news),
         ('36氪', fetch_36kr_rss),
         ('新浪RSS', fetch_sina_rss),
     ]
-    
     success_count = 0
     for name, func in sources:
         try:
@@ -485,18 +466,14 @@ def fetch_all_news() -> List[Dict]:
             time.sleep(0.3)
         except Exception as e:
             logger.error(f"❌ {name} 失败：{e}")
-    
     logger.info(f"✅ 成功 {success_count}/{len(sources)} 个数据源")
-    
     if len(all_news) < 20:
         logger.info(f"📝 补充模拟数据")
         mock_news = generate_mock_news(15)
         all_news.extend(mock_news)
-    
     return all_news
 
 def classify_news(title):
-    """新闻分类"""
     text = title.lower()
     if any(kw in text for kw in ['涨停', '跌停', 'a股', '港股', '美股', '指数', '沪指', '深成指', '创业板', '上证', '收盘', '开盘', '北向', '外资']):
         return 'stock'
@@ -508,14 +485,13 @@ def classify_news(title):
         return 'finance'
     return 'all'
 
-# 初始化
 storage = NewsStorage()
 logger.info("🔄 初始抓取...")
 news = fetch_all_news()
 added = storage.add_news(news)
 logger.info(f"✅ 新增 {added} 条，共 {storage.get_stats()['total']} 条新闻")
 
-# ==================== HTML页面 ====================
+# ==================== HTML页面（方案2：自适应布局） ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -576,14 +552,23 @@ HTML_TEMPLATE = """
         }
         .visit-stats .num { font-weight: bold; color: #fff; }
         
+        /* ===== 方案2：自适应列数 ===== */
         .news-grid {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 1fr;  /* 默认1列（手机） */
             gap: 10px;
         }
-        @media (max-width: 480px) {
-            .news-grid { grid-template-columns: 1fr; }
+        @media (min-width: 600px) {
+            .news-grid {
+                grid-template-columns: 1fr 1fr;  /* 平板2列 */
+            }
         }
+        @media (min-width: 1024px) {
+            .news-grid {
+                grid-template-columns: 1fr 1fr 1fr;  /* 电脑3列 */
+            }
+        }
+        
         .news-item { 
             background: white; 
             border-radius: 10px; 
@@ -597,7 +582,7 @@ HTML_TEMPLATE = """
         }
         .news-item:hover { background: #f8f9ff; transform: translateY(-1px); box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
         .news-item .title { 
-            font-size: 13px; 
+            font-size: 14px; 
             font-weight: 600; 
             margin-bottom: 4px;
             line-height: 1.4;
@@ -874,7 +859,6 @@ class HttpHandler(BaseHTTPRequestHandler):
         path = url_parse.path
         query = urllib.parse.parse_qs(url_parse.query)
 
-        # 记录访问
         if path != '/api/visits' and path != '/api/health':
             client_ip = self.client_address[0]
             visit_stats.record_visit(client_ip)
@@ -923,7 +907,7 @@ class HttpHandler(BaseHTTPRequestHandler):
 # ==================== 启动 ====================
 if __name__ == '__main__':
     print("=" * 60)
-    print("📈 财经科技新闻聚合服务 (GitHub部署版)")
+    print("📈 财经科技新闻聚合服务 (自适应布局)")
     print("📊 数据源：东方财富 + 同花顺 + 富途牛牛 + 36氪 + 新浪")
     print("📁 缓存路径：" + CACHE_FILE)
     print("🌐 访问地址: http://127.0.0.1:5000")
