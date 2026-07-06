@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-财经新闻聚合系统 - GitHub部署版（自适应布局）
+财经新闻聚合系统 - GitHub部署版（自适应布局 + 去重优化）
 数据源：东方财富 + 同花顺 + 富途牛牛 + 36氪 + 新浪
-功能：访问统计 + 自动清理 + 分类筛选
+功能：访问统计 + 自动清理 + 分类筛选 + 智能去重
 """
 import datetime
 import hashlib
@@ -196,9 +196,19 @@ class NewsStorage:
         thread.start()
         logger.info(f"✅ 自动清理已启动（间隔{AUTO_CLEAN_INTERVAL//60}分钟，保留{CACHE_EXPIRE_DAYS}天）")
 
+    # ==================== 核心去重函数（优化） ====================
     def _get_fingerprint(self, news_item: Dict) -> str:
-        text = f"{news_item.get('title', '')}{news_item.get('content', '')[:50]}"
-        return hashlib.md5(text.encode('utf-8')).hexdigest()
+        """生成新闻指纹，用于去重"""
+        # 只用标题生成指纹
+        title = news_item.get('title', '').strip()
+        # 去除【】和[]内的内容（避免同一新闻不同来源显示不同）
+        title = re.sub(r'【.*?】', '', title)
+        title = re.sub(r'\[.*?\]', '', title)
+        # 去除多余空格
+        title = re.sub(r'\s+', ' ', title).strip()
+        # 只取前50个字符
+        title = title[:50]
+        return hashlib.md5(title.encode('utf-8')).hexdigest()
 
     def add_news(self, news_items: List[Dict]) -> int:
         if not news_items:
@@ -491,7 +501,7 @@ news = fetch_all_news()
 added = storage.add_news(news)
 logger.info(f"✅ 新增 {added} 条，共 {storage.get_stats()['total']} 条新闻")
 
-# ==================== HTML页面（方案2：自适应布局） ====================
+# ==================== HTML页面（自适应布局） ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -552,20 +562,20 @@ HTML_TEMPLATE = """
         }
         .visit-stats .num { font-weight: bold; color: #fff; }
         
-        /* ===== 方案2：自适应列数 ===== */
+        /* 自适应布局 */
         .news-grid {
             display: grid;
-            grid-template-columns: 1fr;  /* 默认1列（手机） */
+            grid-template-columns: 1fr;
             gap: 10px;
         }
         @media (min-width: 600px) {
             .news-grid {
-                grid-template-columns: 1fr 1fr;  /* 平板2列 */
+                grid-template-columns: 1fr 1fr;
             }
         }
         @media (min-width: 1024px) {
             .news-grid {
-                grid-template-columns: 1fr 1fr 1fr;  /* 电脑3列 */
+                grid-template-columns: 1fr 1fr 1fr;
             }
         }
         
@@ -907,7 +917,7 @@ class HttpHandler(BaseHTTPRequestHandler):
 # ==================== 启动 ====================
 if __name__ == '__main__':
     print("=" * 60)
-    print("📈 财经科技新闻聚合服务 (自适应布局)")
+    print("📈 财经科技新闻聚合服务 (去重优化版)")
     print("📊 数据源：东方财富 + 同花顺 + 富途牛牛 + 36氪 + 新浪")
     print("📁 缓存路径：" + CACHE_FILE)
     print("🌐 访问地址: http://127.0.0.1:5000")
