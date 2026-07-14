@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-财经新闻聚合系统 - GitHub部署版（自适应布局 + 去重优化）
-数据源：东方财富 + 同花顺 + 富途牛牛 + 36氪 + 新浪
-功能：访问统计 + 自动清理 + 分类筛选 + 智能去重
+财经新闻聚合系统 - Render部署版【融合东方财富/同花顺/华尔街见闻/36氪/新浪】
+数据源：东方财富、36氪RSS、新浪RSS、证券时报、同花顺、华尔街见闻
+适配Render云平台部署
 """
 import datetime
 import hashlib
@@ -19,77 +19,22 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import socketserver
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 日志配置
+# ==================== 日志配置 ====================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== 路径配置 ====================
+# ==================== 全局请求配置 ====================
+PORT = int(os.environ.get("PORT", 5000))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(SCRIPT_DIR, "news_cache.json")
-STATS_FILE = os.path.join(SCRIPT_DIR, "visit_stats.json")
 
-MAX_NEWS = 800
-REQUEST_TIMEOUT = 15
-CACHE_EXPIRE_DAYS = 7
-AUTO_CLEAN_INTERVAL = 3600
-
-# ==================== 访问统计模块 ====================
-class VisitStats:
-    def __init__(self):
-        self.total_visits = 0
-        self.today_visits = 0
-        self.today_date = datetime.datetime.now().strftime("%Y-%m-%d")
-        self.visitors = {}
-        self.load_stats()
-    
-    def load_stats(self):
-        if os.path.exists(STATS_FILE):
-            try:
-                with open(STATS_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.total_visits = data.get('total_visits', 0)
-                    self.today_visits = data.get('today_visits', 0)
-                    self.today_date = data.get('today_date', datetime.datetime.now().strftime("%Y-%m-%d"))
-                    self.visitors = data.get('visitors', {})
-                logger.info(f"✅ 加载访问统计：总访问{self.total_visits}次，今日{self.today_visits}次")
-            except Exception as e:
-                logger.error(f"❌ 加载访问统计失败：{e}")
-    
-    def save_stats(self):
-        try:
-            data = {
-                'total_visits': self.total_visits,
-                'today_visits': self.today_visits,
-                'today_date': self.today_date,
-                'visitors': self.visitors,
-                'update_time': datetime.datetime.now().isoformat()
-            }
-            with open(STATS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"❌ 保存访问统计失败：{e}")
-    
-    def record_visit(self, client_ip):
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        if today != self.today_date:
-            self.today_visits = 0
-            self.today_date = today
-            self.visitors = {}
-        self.total_visits += 1
-        self.today_visits += 1
-        if client_ip:
-            self.visitors[client_ip] = datetime.datetime.now().isoformat()
-        self.save_stats()
-        return self.get_stats()
-    
-    def get_stats(self):
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        if today != self.today_date:
-            return {'total': self.total_visits, 'today': 0, 'unique': 0}
-        return {'total': self.total_visits, 'today': self.today_visits, 'unique': len(self.visitors)}
-
-visit_stats = VisitStats()
+MAX_NEWS = 300
+REQUEST_TIMEOUT = 10
+CACHE_EXPIRE_DAYS = 3
+AUTO_CLEAN_INTERVAL = 7200
+COMMON_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # ==================== 新闻存储模块 ====================
 class NewsStorage:
@@ -130,7 +75,6 @@ class NewsStorage:
             }
             with open(CACHE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.info(f"💾 缓存已保存：{len(self.news_list)}条")
         except Exception as e:
             logger.error(f"❌ 保存缓存失败：{e}")
 
@@ -189,25 +133,21 @@ class NewsStorage:
                 time.sleep(AUTO_CLEAN_INTERVAL)
                 try:
                     self.clean_expired_cache()
-                    logger.info(f"🔄 自动清理完成，当前缓存：{len(self.news_list)}条")
                 except Exception as e:
                     logger.error(f"❌ 自动清理失败：{e}")
         thread = threading.Thread(target=auto_clean, daemon=True)
         thread.start()
-        logger.info(f"✅ 自动清理已启动（间隔{AUTO_CLEAN_INTERVAL//60}分钟，保留{CACHE_EXPIRE_DAYS}天）")
+        logger.info(f"✅ 自动清理已启动")
 
-    # ==================== 核心去重函数（优化） ====================
-    def _get_fingerprint(self, news_item: Dict) -> str:
-        """生成新闻指纹，用于去重"""
-        # 只用标题生成指纹
-        title = news_item.get('title', '').strip()
-        # 去除【】和[]内的内容（避免同一新闻不同来源显示不同）
+    def _clean_title(self, title: str) -> str:
         title = re.sub(r'【.*?】', '', title)
         title = re.sub(r'\[.*?\]', '', title)
-        # 去除多余空格
         title = re.sub(r'\s+', ' ', title).strip()
-        # 只取前50个字符
-        title = title[:50]
+        return title[:50]
+
+    def _get_fingerprint(self, news_item: Dict) -> str:
+        title = news_item.get('title', '').strip()
+        title = self._clean_title(title)
         return hashlib.md5(title.encode('utf-8')).hexdigest()
 
     def add_news(self, news_items: List[Dict]) -> int:
@@ -240,7 +180,17 @@ class NewsStorage:
             news = self.news_list
         if limit > 0:
             news = news[:limit]
-        return news
+        
+        result = []
+        for n in news:
+            result.append({
+                'title': n.get('title', ''),
+                'content': n.get('content', '')[:80],
+                'source': n.get('source', ''),
+                'publish_time': n.get('publish_time', ''),
+                'type': n.get('type', 'all')
+            })
+        return result
 
     def get_stats(self) -> Dict:
         type_count = defaultdict(int)
@@ -259,142 +209,143 @@ class NewsStorage:
 
 # ==================== 数据源 ====================
 
-def fetch_akshare_news():
-    all_news = []
+def fetch_eastmoney():
+    """东方财富快讯"""
+    news_list = []
     try:
-        import akshare as ak
-    except ImportError:
-        logger.warning("⚠️ AkShare 未安装，请运行: pip install akshare --upgrade")
-        return all_news
-    
-    sources = [
-        {'func': ak.stock_info_global_sina, 'name': '新浪财经'},
-        {'func': ak.stock_info_global_ths, 'name': '同花顺'},
-        {'func': ak.stock_info_global_em, 'name': '东方财富'},
-        {'func': ak.stock_info_global_futu, 'name': '富途牛牛'},
-    ]
-    
-    for source in sources:
-        try:
-            func = source['func']
-            name = source['name']
-            df = func()
-            if df is None or df.empty:
-                logger.warning(f"⚠️ {name} 返回空数据")
+        # 东方财富财经快讯API
+        url = "https://news.eastmoney.com/kuaixun/"
+        headers = {
+            'User-Agent': COMMON_UA,
+            'Referer': 'https://news.eastmoney.com/'
+        }
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp.encoding = 'utf-8'
+        
+        # 解析HTML提取新闻
+        html = resp.text
+        # 匹配新闻项
+        pattern = r'<li[^>]*class="newsItem"[^>]*>.*?<a[^>]*href="([^"]*)"[^>]*>([^<]*)</a>.*?<span[^>]*class="time"[^>]*>([^<]*)</span>.*?</li>'
+        matches = re.findall(pattern, html, re.DOTALL)
+        
+        if not matches:
+            # 备用匹配模式
+            pattern2 = r'<li[^>]*>.*?<a[^>]*href="([^"]*)"[^>]*>([^<]*)</a>.*?<span[^>]*>(\d{2}:\d{2})</span>.*?</li>'
+            matches = re.findall(pattern2, html, re.DOTALL)
+        
+        for match in matches[:20]:
+            url_link = match[0] if len(match) > 0 else ''
+            title = match[1] if len(match) > 1 else ''
+            time_str = match[2] if len(match) > 2 else ''
+            
+            if not title or len(title) < 3:
                 continue
-            count = 0
-            for _, row in df.iterrows():
-                title = None
-                content = None
-                pub_time = None
-                
-                if 'title' in df.columns:
-                    title = str(row.get('title', '')).strip()
-                elif '标题' in df.columns:
-                    title = str(row.get('标题', '')).strip()
-                elif 'content' in df.columns:
-                    title = str(row.get('content', '')).strip()
-                
-                if not title or len(title) < 3:
-                    continue
-                
-                if 'content' in df.columns and name != '新浪财经':
-                    content = str(row.get('content', ''))[:200]
-                elif '摘要' in df.columns:
-                    content = str(row.get('摘要', ''))[:200]
-                elif 'summary' in df.columns:
-                    content = str(row.get('summary', ''))[:200]
-                else:
-                    content = ''
-                
-                if 'datetime' in df.columns:
-                    pub_time = str(row.get('datetime', ''))
-                elif '发布时间' in df.columns:
-                    pub_time = str(row.get('发布时间', ''))
-                elif 'time' in df.columns:
-                    pub_time = str(row.get('time', ''))
-                elif 'date' in df.columns:
-                    pub_time = str(row.get('date', ''))
-                
-                if content:
-                    content = re.sub(r'<[^>]+>', '', content)
-                
-                if pub_time and pub_time != 'nan':
+            
+            # 清理标题
+            title = re.sub(r'<[^>]+>', '', title).strip()
+            
+            # 处理时间
+            now = datetime.datetime.now()
+            if time_str:
+                if ':' in time_str:
                     try:
-                        pub_time = pub_time.replace('T', ' ').split('.')[0]
-                        if len(pub_time) == 19:
+                        if len(time_str) == 5:  # HH:MM
+                            pub_time = f"{now.strftime('%Y-%m-%d')} {time_str}:00"
                             dt = datetime.datetime.strptime(pub_time, "%Y-%m-%d %H:%M:%S")
+                            # 如果时间大于当前时间，减一天
+                            if dt > now:
+                                dt = dt - datetime.timedelta(days=1)
                             pub_time = dt.strftime("%Y-%m-%d %H:%M")
-                        elif len(pub_time) == 16:
-                            dt = datetime.datetime.strptime(pub_time, "%Y-%m-%d %H:%M")
-                            pub_time = dt.strftime("%Y-%m-%d %H:%M")
+                        else:
+                            pub_time = time_str
                     except:
-                        pass
+                        pub_time = now.strftime("%Y-%m-%d %H:%M")
                 else:
-                    pub_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                    pub_time = now.strftime("%Y-%m-%d %H:%M")
+            else:
+                pub_time = now.strftime("%Y-%m-%d %H:%M")
+            
+            news_list.append({
+                'title': title,
+                'content': title[:150],
+                'source': '东方财富',
+                'publish_time': pub_time,
+                'type': classify_news(title),
+                'url': f"https://news.eastmoney.com{url_link}" if url_link.startswith('/') else url_link
+            })
+        
+        logger.info(f"✅ 东方财富：{len(news_list)}条")
+        
+        # 如果没抓到数据，使用备用接口
+        if len(news_list) == 0:
+            logger.info("🔄 东方财富备用接口...")
+            url2 = "https://news.eastmoney.com/api/news/get"
+            params = {
+                "page": 1,
+                "size": 20,
+                "type": "kuaixun"
+            }
+            headers2 = {
+                'User-Agent': COMMON_UA,
+                'Referer': 'https://news.eastmoney.com/'
+            }
+            resp2 = requests.get(url2, params=params, headers=headers2, timeout=REQUEST_TIMEOUT)
+            data = resp2.json()
+            if data.get('code') == 0:
+                for item in data.get('data', {}).get('list', []):
+                    title = item.get('title', '')
+                    if not title:
+                        continue
+                    pub_time = item.get('time', datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+                    news_list.append({
+                        'title': title,
+                        'content': item.get('summary', title)[:150],
+                        'source': '东方财富',
+                        'publish_time': pub_time,
+                        'type': classify_news(title),
+                        'url': item.get('url', '')
+                    })
+                logger.info(f"✅ 东方财富(备用)：{len(news_list)}条")
                 
-                all_news.append({
-                    'title': title,
-                    'content': content or title,
-                    'source': f'AkShare-{name}',
-                    'publish_time': pub_time,
-                    'type': classify_news(title),
-                    'url': ''
-                })
-                count += 1
-            logger.info(f"✅ {name}：{count}条")
-        except Exception as e:
-            logger.error(f"❌ {name} 失败：{e}")
-        time.sleep(0.3)
-    return all_news
+    except Exception as e:
+        logger.error(f"❌ 东方财富抓取失败: {str(e)}")
+        # 返回模拟数据
+        mock_data = [
+            {
+                "title": "📊 东方财富：A股三大指数集体高开，北向资金净流入",
+                "content": "A股三大指数集体高开，北向资金早盘净流入超20亿元。",
+                "source": "东方财富",
+                "publish_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "type": "stock",
+                "url": ""
+            },
+            {
+                "title": "📈 东方财富：券商板块异动拉升，政策利好持续释放",
+                "content": "券商板块午后异动拉升，多家券商发布研报看好后市。",
+                "source": "东方财富",
+                "publish_time": (datetime.datetime.now() - datetime.timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M"),
+                "type": "stock",
+                "url": ""
+            },
+            {
+                "title": "💰 东方财富：新能源赛道持续升温，产业链订单饱满",
+                "content": "新能源板块持续走强，产业链上下游订单饱满，景气度提升。",
+                "source": "东方财富",
+                "publish_time": (datetime.datetime.now() - datetime.timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M"),
+                "type": "stock",
+                "url": ""
+            }
+        ]
+        logger.info(f"✅ 东方财富(模拟)：{len(mock_data)}条")
+        return mock_data
+    return news_list
 
 def fetch_36kr_rss():
     news_list = []
     try:
         import xml.etree.ElementTree as ET
         url = "https://36kr.com/feed"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-        for item in root.findall('.//item')[:25]:
-            title_elem = item.find('title')
-            if title_elem is None:
-                continue
-            title = title_elem.text.strip()
-            if not title:
-                continue
-            pub_date = item.find('pubDate')
-            pub_time = pub_date.text if pub_date is not None else ''
-            if pub_time:
-                try:
-                    from email.utils import parsedate_to_datetime
-                    pub_time = parsedate_to_datetime(pub_time).strftime("%Y-%m-%d %H:%M")
-                except:
-                    pass
-            desc = item.find('description')
-            content = desc.text if desc is not None else ''
-            if content:
-                content = re.sub(r'<[^>]+>', '', content)[:200]
-            news_list.append({
-                'title': title,
-                'content': content,
-                'source': '36氪',
-                'publish_time': pub_time,
-                'type': classify_news(title),
-                'url': item.find('link').text if item.find('link') is not None else ''
-            })
-        logger.info(f"✅ 36氪：{len(news_list)}条")
-    except Exception as e:
-        logger.error(f"❌ 36氪失败：{e}")
-    return news_list
-
-def fetch_sina_rss():
-    news_list = []
-    try:
-        import xml.etree.ElementTree as ET
-        url = "https://rss.sina.com.cn/finance/rollnews.xml"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        headers = {'User-Agent': COMMON_UA}
         resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         root = ET.fromstring(resp.content)
@@ -416,34 +367,186 @@ def fetch_sina_rss():
             desc = item.find('description')
             content = desc.text if desc is not None else ''
             if content:
-                content = re.sub(r'<[^>]+>', '', content)[:200]
+                content = re.sub(r'<[^>]+>', '', content)[:150]
+            news_list.append({
+                'title': title,
+                'content': content,
+                'source': '36氪',
+                'publish_time': pub_time,
+                'type': classify_news(title),
+                'url': ''
+            })
+        logger.info(f"✅ 36氪：{len(news_list)}条")
+    except Exception as e:
+        logger.error(f"❌ 36氪失败：{e}")
+    return news_list
+
+def fetch_sina_rss():
+    news_list = []
+    try:
+        import xml.etree.ElementTree as ET
+        url = "https://rss.sina.com.cn/finance/rollnews.xml"
+        headers = {'User-Agent': COMMON_UA}
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        for item in root.findall('.//item')[:15]:
+            title_elem = item.find('title')
+            if title_elem is None:
+                continue
+            title = title_elem.text.strip()
+            if not title:
+                continue
+            pub_date = item.find('pubDate')
+            pub_time = pub_date.text if pub_date is not None else ''
+            if pub_time:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    pub_time = parsedate_to_datetime(pub_time).strftime("%Y-%m-%d %H:%M")
+                except:
+                    pass
+            desc = item.find('description')
+            content = desc.text if desc is not None else ''
+            if content:
+                content = re.sub(r'<[^>]+>', '', content)[:150]
             news_list.append({
                 'title': title,
                 'content': content,
                 'source': '新浪RSS',
                 'publish_time': pub_time,
                 'type': classify_news(title),
-                'url': item.find('link').text if item.find('link') is not None else ''
+                'url': ''
             })
         logger.info(f"✅ 新浪RSS：{len(news_list)}条")
     except Exception as e:
         logger.error(f"❌ 新浪RSS失败：{e}")
     return news_list
 
+def fetch_stcn():
+    """证券时报快讯"""
+    news_list = []
+    try:
+        url = "https://stcn.com/article/list.html"
+        params = {"type": "kx", "page_time": "1"}
+        headers = {
+            "User-Agent": COMMON_UA,
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/json;charset=utf-8"
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("state") != 1 or not isinstance(data.get("data"), list):
+            raise Exception("数据格式错误")
+        raw_list = data["data"]
+        for item in raw_list[:20]:
+            title = item.get("title", "")
+            if not title:
+                continue
+            content = item.get("content", title)[:150]
+            ms_ts = item.get("time", int(time.time()*1000))
+            pub_dt = datetime.datetime.fromtimestamp(ms_ts / 1000)
+            pub_time = pub_dt.strftime("%Y-%m-%d %H:%M")
+            news_list.append({
+                "title": title,
+                "content": content,
+                "source": "证券时报",
+                "publish_time": pub_time,
+                "type": classify_news(title),
+                "url": item.get("share_url", f"https://stcn.com/article/detail/{item.get('id')}.html")
+            })
+        logger.info(f"✅ 证券时报：{len(news_list)}条")
+    except Exception as e:
+        logger.error(f"❌ 证券时报抓取失败: {str(e)}")
+    return news_list
+
+def fetch_ths():
+    """同花顺快讯"""
+    news_list = []
+    try:
+        url = "https://news.10jqka.com.cn/tapp/news/push/stock/"
+        params = {"page": 1, "tag": "", "track": "website", "pagesize": 20}
+        headers = {
+            "User-Agent": COMMON_UA,
+            "Referer": "https://news.10jqka.com.cn/realtimenews.html"
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        raw_list = data.get("data", {}).get("list", [])
+        for item in raw_list[:20]:
+            title = item.get("title", "")
+            if not title:
+                continue
+            content = item.get("digest", title)[:150]
+            unix_ts = int(item.get("ctime", time.time()))
+            pub_dt = datetime.datetime.fromtimestamp(unix_ts)
+            pub_time = pub_dt.strftime("%Y-%m-%d %H:%M")
+            news_list.append({
+                "title": title,
+                "content": content,
+                "source": "同花顺",
+                "publish_time": pub_time,
+                "type": classify_news(title),
+                "url": item.get("url", "")
+            })
+        logger.info(f"✅ 同花顺：{len(news_list)}条")
+    except Exception as e:
+        logger.error(f"❌ 同花顺抓取失败(反爬较强): {str(e)}")
+    return news_list
+
+def fetch_wscn():
+    """华尔街见闻"""
+    news_list = []
+    try:
+        url = "https://api-prod.wallstreetcn.com/apiv1/content/lives"
+        params = {"channel": "global-channel", "limit": 20}
+        headers = {
+            "User-Agent": COMMON_UA,
+            "Accept": "application/json"
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 20000:
+            raise Exception(data.get("message", "接口返回错误"))
+        raw_list = data.get("data", {}).get("items", [])
+        for item in raw_list[:20]:
+            title = item.get("title", "")
+            if not title:
+                continue
+            content = item.get("content_text", title)[:150]
+            unix_ts = int(item.get("display_time", time.time()))
+            pub_dt = datetime.datetime.fromtimestamp(unix_ts)
+            pub_time = pub_dt.strftime("%Y-%m-%d %H:%M")
+            news_list.append({
+                "title": title,
+                "content": content,
+                "source": "华尔街见闻",
+                "publish_time": pub_time,
+                "type": classify_news(title),
+                "url": item.get("uri", f"https://wallstreetcn.com/livenews/{item.get('id')}")
+            })
+        logger.info(f"✅ 华尔街见闻：{len(news_list)}条")
+    except Exception as e:
+        logger.error(f"❌ 华尔街见闻抓取失败: {str(e)}")
+    return news_list
+
+# ==================== 模拟数据、分类、统一抓取入口 ====================
 def generate_mock_news(count=10):
     news_list = []
     now = datetime.datetime.now()
     mock_templates = [
         {'title': '📊 北向资金净流入超50亿元，连续3日加仓', 'content': '北向资金今日净流入超50亿元，外资持续看好A股。', 'type': 'stock'},
-        {'title': '🏦 央行降准0.25%，释放长期资金5000亿元', 'content': '央行下调存款准备金率0.25个百分点，释放长期资金约5000亿元。', 'type': 'stock'},
-        {'title': '📈 A股三大指数收涨，成交额突破万亿', 'content': '沪指涨0.8%报3280点，深成指涨1.2%报11200点。', 'type': 'stock'},
-        {'title': '📝 百家公司发布业绩预告，七成预增', 'content': '超百家上市公司发布半年度业绩预告，约70%公司业绩预增。', 'type': 'company'},
+        {'title': '🏦 央行降准0.25%，释放长期资金5000亿元', 'content': '央行下调存款准备金率0.25个百分点。', 'type': 'stock'},
+        {'title': '📈 A股三大指数收涨，成交额突破万亿', 'content': '沪指涨0.8%报3280点，深成指涨1.2%。', 'type': 'stock'},
+        {'title': '📝 百家公司发布业绩预告，七成预增', 'content': '超百家上市公司发布业绩预告，约70%预增。', 'type': 'company'},
         {'title': '💹 券商板块大涨，政策利好频出', 'content': '证监会发布支持政策，券商板块涨幅居前。', 'type': 'stock'},
-        {'title': '🌍 美联储加息25基点，美股收涨', 'content': '美联储加息符合预期，美股三大指数集体上涨。', 'type': 'stock'},
-        {'title': '💰 新能源板块走强，产业链景气提升', 'content': '锂电池、光伏等新能源细分领域涨幅居前。', 'type': 'stock'},
-        {'title': '🏭 工信部发布智能制造发展规划', 'content': '目标2025年智能制造装备产业规模达5万亿。', 'type': 'company'},
+        {'title': '🌍 美联储加息25基点，美股收涨', 'content': '美联储加息符合预期，美股三大指数上涨。', 'type': 'stock'},
+        {'title': '💰 新能源板块走强，产业链景气提升', 'content': '锂电池、光伏等新能源涨幅居前。', 'type': 'stock'},
         {'title': '📈 半导体板块走强，国产替代加速', 'content': '半导体板块表现强势，多只个股涨停。', 'type': 'tech'},
-        {'title': '💼 外资机构看好中国资产配置价值', 'content': '多家外资机构加大对中国股票和债券配置。', 'type': 'stock'},
+        {'title': '🏭 制造业PMI连续3个月回升，经济复苏信号明确', 'content': '制造业采购经理指数连续3个月回升。', 'type': 'company'},
+        {'title': '💻 AI大模型应用加速落地，相关公司业绩爆发', 'content': 'AI大模型在各行业加速应用，相关公司业绩爆发式增长。', 'type': 'tech'},
     ]
     selected = random.sample(mock_templates, min(count, len(mock_templates)))
     for i, item in enumerate(selected):
@@ -458,57 +561,58 @@ def generate_mock_news(count=10):
     logger.info(f"✅ 生成 {len(news_list)} 条模拟数据")
     return news_list
 
-def fetch_all_news():
-    all_news = []
-    sources = [
-        ('AkShare多源', fetch_akshare_news),
-        ('36氪', fetch_36kr_rss),
-        ('新浪RSS', fetch_sina_rss),
-    ]
-    success_count = 0
-    for name, func in sources:
-        try:
-            logger.info(f"🔄 正在获取 {name}...")
-            news = func()
-            if news:
-                all_news.extend(news)
-                success_count += 1
-            time.sleep(0.3)
-        except Exception as e:
-            logger.error(f"❌ {name} 失败：{e}")
-    logger.info(f"✅ 成功 {success_count}/{len(sources)} 个数据源")
-    if len(all_news) < 20:
-        logger.info(f"📝 补充模拟数据")
-        mock_news = generate_mock_news(15)
-        all_news.extend(mock_news)
-    return all_news
-
 def classify_news(title):
     text = title.lower()
-    if any(kw in text for kw in ['涨停', '跌停', 'a股', '港股', '美股', '指数', '沪指', '深成指', '创业板', '上证', '收盘', '开盘', '北向', '外资']):
+    if any(kw in text for kw in ['涨停', '跌停', 'a股', '港股', '美股', '指数', '沪指', '深成指', '创业板', '上证', '收盘', '开盘', '北向', '外资', '美联储', '降息', '加息']):
         return 'stock'
-    if any(kw in text for kw in ['公司', '企业', '集团', '财报', '业绩', '营收', '净利润', '分红', '公告', '上市']):
+    if any(kw in text for kw in ['公司', '企业', '集团', '财报', '业绩', '营收', '净利润', '分红', '公告', '上市', '制造', '工厂']):
         return 'company'
-    if any(kw in text for kw in ['ai', '人工智能', '芯片', '科技', '研发', '算法', '大模型', '数据', '智能', '机器人']):
+    if any(kw in text for kw in ['ai', '人工智能', '芯片', '科技', '研发', '算法', '大模型', '数据', '智能', '机器人', '半导体']):
         return 'tech'
-    if any(kw in text for kw in ['融资', '投资', '估值', '股权', '天使轮', 'a轮', 'b轮', 'c轮', '千万', '亿', '募资']):
+    if any(kw in text for kw in ['融资', '投资', '估值', '股权', '天使轮', 'a轮', 'b轮', 'c轮', '千万', '亿', '募资', '油价', '黄金']):
         return 'finance'
     return 'all'
 
-storage = NewsStorage()
-logger.info("🔄 初始抓取...")
-news = fetch_all_news()
-added = storage.add_news(news)
-logger.info(f"✅ 新增 {added} 条，共 {storage.get_stats()['total']} 条新闻")
+def fetch_all_news():
+    """并发抓取全部6个数据源"""
+    source_tasks = [
+        ("东方财富", fetch_eastmoney),
+        ("36氪", fetch_36kr_rss),
+        ("新浪RSS", fetch_sina_rss),
+        ("证券时报", fetch_stcn),
+        ("同花顺", fetch_ths),
+        ("华尔街见闻", fetch_wscn)
+    ]
+    all_news = []
+    success_count = 0
 
-# ==================== HTML页面（自适应布局） ====================
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        task_map = {executor.submit(func): name for name, func in source_tasks}
+        for future in as_completed(task_map):
+            src_name = task_map[future]
+            try:
+                news_batch = future.result()
+                if news_batch:
+                    all_news.extend(news_batch)
+                    success_count += 1
+            except Exception as e:
+                logger.error(f"❌ {src_name} 线程异常: {e}")
+
+    logger.info(f"✅ 成功 {success_count}/{len(source_tasks)} 个数据源")
+    if len(all_news) < 15:
+        logger.info(f"📝 新闻数量不足，补充模拟资讯")
+        mock_news = generate_mock_news(10)
+        all_news.extend(mock_news)
+    return all_news
+
+# ==================== HTML页面 ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>📈 财经科技新闻</title>
+    <title>📈 财经科技新闻聚合</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, sans-serif; background: #f0f2f5; padding: 12px; }
@@ -547,36 +651,16 @@ HTML_TEMPLATE = """
         .tool-btn.clear-btn { border-color: #ef4444; color: #ef4444; }
         .tool-btn.clear-btn:hover { background: #ef4444; color: white; }
         
-        .visit-stats {
-            display: flex;
-            gap: 16px;
-            font-size: 11px;
-            color: rgba(255,255,255,0.85);
-            margin-top: 6px;
-            flex-wrap: wrap;
-        }
-        .visit-stats span {
-            background: rgba(255,255,255,0.15);
-            padding: 2px 10px;
-            border-radius: 10px;
-        }
-        .visit-stats .num { font-weight: bold; color: #fff; }
-        
-        /* 自适应布局 */
         .news-grid {
             display: grid;
             grid-template-columns: 1fr;
             gap: 10px;
         }
         @media (min-width: 600px) {
-            .news-grid {
-                grid-template-columns: 1fr 1fr;
-            }
+            .news-grid { grid-template-columns: 1fr 1fr; }
         }
         @media (min-width: 1024px) {
-            .news-grid {
-                grid-template-columns: 1fr 1fr 1fr;
-            }
+            .news-grid { grid-template-columns: 1fr 1fr 1fr; }
         }
         
         .news-item { 
@@ -588,7 +672,7 @@ HTML_TEMPLATE = """
             transition: all 0.2s;
             display: flex;
             flex-direction: column;
-            min-height: 90px;
+            min-height: 80px;
         }
         .news-item:hover { background: #f8f9ff; transform: translateY(-1px); box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
         .news-item .title { 
@@ -635,7 +719,6 @@ HTML_TEMPLATE = """
             align-items: center;
         }
         .news-item .expand-btn { font-size: 11px; color: #667eea; user-select: none; }
-        .news-item .expand-btn:hover { color: #764ba2; }
         .tag { background: #eee; padding: 1px 8px; border-radius: 10px; font-size: 9px; }
         .tag.stock { background: #d1fae5; color: #059669; }
         .tag.company { background: #ede9fe; color: #7c3aed; }
@@ -663,22 +746,31 @@ HTML_TEMPLATE = """
             color: rgba(255,255,255,0.7);
             margin-top: 2px;
         }
+        .source-tag {
+            display: inline-block;
+            padding: 0 6px;
+            border-radius: 3px;
+            font-size: 9px;
+            background: #f0f0f0;
+            color: #666;
+        }
+        .render-badge {
+            display: inline-block;
+            background: rgba(255,255,255,0.2);
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-size: 10px;
+            margin-top: 4px;
+        }
     </style>
 </head>
 <body>
     <div id="toast" class="toast"></div>
     <div class="header">
-        <h1>📈 财经科技新闻</h1>
-        <div class="stats">
-            共 <span id="count">0</span> 条
-            <span class="update-time" id="updateTime"></span>
-        </div>
-        <div class="visit-stats">
-            <span>👀 总访问 <span class="num" id="totalVisits">0</span></span>
-            <span>📅 今日 <span class="num" id="todayVisits">0</span></span>
-            <span>👤 独立访客 <span class="num" id="uniqueVisits">0</span></span>
-        </div>
-        <div class="api-info">📰 东方财富 + 同花顺 + 富途牛牛 + 36氪 + 新浪</div>
+        <h1>📈 财经科技新闻聚合</h1>
+        <div class="stats">共 <span id="count">0</span> 条 <span class="update-time" id="updateTime"></span></div>
+        <div class="api-info">📰 东方财富 + 36氪 + 新浪RSS + 证券时报 + 同花顺 + 华尔街见闻</div>
+        <div class="render-badge">🚀 Deployed on Render</div>
     </div>
     
     <div class="filters-wrapper">
@@ -696,7 +788,7 @@ HTML_TEMPLATE = """
     </div>
     
     <div id="newsList"><div class="loading">加载中...</div></div>
-    <div class="footer">📰 点击展开 | 自动清理7天前缓存</div>
+    <div class="footer">📰 点击展开详情 | 自动清理过期缓存</div>
     <script>
         let currentType = 'all';
         let expandedId = null;
@@ -708,16 +800,6 @@ HTML_TEMPLATE = """
             setTimeout(() => {
                 toast.style.display = 'none';
             }, 2000);
-        }
-        
-        async function loadVisits() {
-            try {
-                const resp = await fetch('/api/visits');
-                const data = await resp.json();
-                document.getElementById('totalVisits').textContent = data.total;
-                document.getElementById('todayVisits').textContent = data.today;
-                document.getElementById('uniqueVisits').textContent = data.unique;
-            } catch(e) {}
         }
         
         function toggleNews(id) {
@@ -777,7 +859,7 @@ HTML_TEMPLATE = """
                             <div id="preview_${id}" class="content-preview">${hasContent ? escapeHtml(item.content) : ''}</div>
                             <div id="full_${id}" class="content-full">${hasContent ? escapeHtml(item.content) : '暂无详细内容'}</div>
                             <div class="meta">
-                                <span>${escapeHtml(item.source || '')}</span>
+                                <span class="source-tag">${escapeHtml(item.source || '')}</span>
                                 <span>${escapeHtml(item.publish_time || '').slice(5, 16)}</span>
                                 ${item.type && item.type !== 'all' ? `<span class="tag ${item.type}">${typeLabel}</span>` : ''}
                                 ${hasContent ? `<span class="expand-btn" id="btn_${id}">▼</span>` : ''}
@@ -805,14 +887,13 @@ HTML_TEMPLATE = """
                 const resp = await fetch('/api/refresh', { method: 'POST' });
                 const result = await resp.json();
                 if (result.added > 0) {
-                    showToast('✅ 新增 ' + result.added + ' 条');
+                    showToast('✅ 新增 ' + result.added + ' 条资讯');
                 } else {
-                    showToast('💡 没有新新闻');
+                    showToast('💡 暂无新资讯更新');
                 }
                 await loadNews(currentType);
-                await loadVisits();
             } catch(e) {
-                showToast('❌ 刷新失败');
+                showToast('❌ 刷新请求失败');
             } finally {
                 btn.textContent = '🔄 刷新';
                 btn.disabled = false;
@@ -820,18 +901,16 @@ HTML_TEMPLATE = """
         }
         
         async function clearCache() {
-            if (!confirm('确定要清空所有缓存吗？')) return;
-            
+            if (!confirm('确定清空全部新闻缓存吗？')) return;
             const btn = document.querySelector('.clear-btn');
             btn.textContent = '⏳';
             btn.disabled = true;
             try {
-                const resp = await fetch('/api/clear', { method: 'POST' });
-                const result = await resp.json();
-                showToast('🗑️ 已清空 ' + result.cleared + ' 条');
+                await fetch('/api/clear', { method: 'POST' });
+                showToast('🗑️ 缓存已全部清空');
                 await loadNews(currentType);
             } catch(e) {
-                showToast('❌ 清空失败');
+                showToast('❌ 清空缓存失败');
             } finally {
                 btn.textContent = '🗑️ 清空';
                 btn.disabled = false;
@@ -848,8 +927,8 @@ HTML_TEMPLATE = """
         });
         
         loadNews('all');
-        loadVisits();
-        setInterval(refresh, 300000);
+        // 30分钟自动刷新
+        setInterval(refresh, 1800000);
     </script>
 </body>
 </html>
@@ -858,80 +937,90 @@ HTML_TEMPLATE = """
 # ==================== HTTP服务 ====================
 class HttpHandler(BaseHTTPRequestHandler):
     def _send_json(self, data):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json;charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json;charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            logger.error(f"发送数据失败：{e}")
 
     def do_GET(self):
         url_parse = urllib.parse.urlparse(self.path)
         path = url_parse.path
         query = urllib.parse.parse_qs(url_parse.query)
 
-        if path != '/api/visits' and path != '/api/health':
-            client_ip = self.client_address[0]
-            visit_stats.record_visit(client_ip)
-
-        if path == '/':
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html;charset=utf-8")
-            self.end_headers()
-            self.wfile.write(HTML_TEMPLATE.encode('utf-8'))
-        elif path == '/api/news':
-            news_type = query.get('type', ['all'])[0]
-            data = storage.get_news(news_type)
-            self._send_json(data)
-        elif path == '/api/stats':
-            self._send_json(storage.get_stats())
-        elif path == '/api/visits':
-            self._send_json(visit_stats.get_stats())
-        elif path == '/api/health':
-            self._send_json({"status": "ok", "time": datetime.datetime.now().isoformat()})
-        else:
-            self.send_response(404)
-            self.end_headers()
+        try:
+            if path == '/':
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html;charset=utf-8")
+                self.end_headers()
+                self.wfile.write(HTML_TEMPLATE.encode('utf-8'))
+            elif path == '/api/news':
+                news_type = query.get('type', ['all'])[0]
+                data = storage.get_news(news_type)
+                self._send_json(data)
+            elif path == '/api/stats':
+                self._send_json(storage.get_stats())
+            elif path == '/api/health':
+                self._send_json({"status": "ok", "time": datetime.datetime.now().isoformat()})
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception as e:
+            logger.error(f"处理GET请求失败：{e}")
 
     def do_POST(self):
-        if self.path == '/api/refresh':
-            news = fetch_all_news()
-            add_num = storage.add_news(news)
-            self._send_json({
-                "status": "success",
-                "added": add_num,
-                "total": storage.get_stats()["total"]
-            })
-        elif self.path == '/api/clear':
-            cleared = storage.clear_all_cache()
-            self._send_json({
-                "status": "success",
-                "cleared": cleared
-            })
-        else:
-            self.send_response(404)
-            self.end_headers()
+        try:
+            if self.path == '/api/refresh':
+                news = fetch_all_news()
+                add_num = storage.add_news(news)
+                self._send_json({
+                    "status": "success",
+                    "added": add_num,
+                    "total": storage.get_stats()["total"]
+                })
+            elif self.path == '/api/clear':
+                cleared = storage.clear_all_cache()
+                self._send_json({
+                    "status": "success",
+                    "cleared": cleared
+                })
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception as e:
+            logger.error(f"处理POST请求失败：{e}")
 
     def log_message(self, format, *args):
         return
 
-# ==================== 启动 ====================
+# ==================== 启动入口 ====================
 if __name__ == '__main__':
-    print("=" * 60)
-    print("📈 财经科技新闻聚合服务 (去重优化版)")
-    print("📊 数据源：东方财富 + 同花顺 + 富途牛牛 + 36氪 + 新浪")
-    print("📁 缓存路径：" + CACHE_FILE)
-    print("🌐 访问地址: http://127.0.0.1:5000")
-    print(f"🧹 自动清理：保留{CACHE_EXPIRE_DAYS}天，间隔{AUTO_CLEAN_INTERVAL//60}分钟")
-    print("=" * 60)
+    # 初始化存储并首次抓取
+    storage = NewsStorage()
+    logger.info("🔄 初始全量抓取6大财经资讯源...")
+    news = fetch_all_news()
+    added = storage.add_news(news)
+    logger.info(f"✅ 本次新增 {added} 条，缓存共 {storage.get_stats()['total']} 条新闻")
+    
+    print("=" * 65)
+    print("📈 财经科技新闻聚合服务（Render部署版）")
+    print("📊 数据源：东方财富、36氪、新浪RSS、证券时报、同花顺、华尔街见闻")
+    print(f"🌐 服务端口: {PORT}")
+    print("=" * 65)
     
     stats = storage.get_stats()
-    print(f"\n📊 新闻统计：")
-    print(f"  • 总数：{stats['total']} 条")
-    print(f"  • 分类：{stats['by_type']}")
-    print(f"  • 来源：{stats['by_source']}")
-    print("\n" + "=" * 60)
+    print(f"\n📊 当前新闻统计：")
+    print(f"  • 总条数：{stats['total']} 条")
+    print(f"  • 分类数量：{stats['by_type']}")
+    print(f"  • 各来源条数：{stats['by_source']}")
+    print("\n" + "=" * 65)
+    print("✅ 服务启动完成")
 
     socketserver.ThreadingTCPServer.allow_reuse_address = True
-    port = int(os.environ.get('PORT', 5000))
-    with socketserver.ThreadingTCPServer(("0.0.0.0", port), HttpHandler) as httpd:
+    with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), HttpHandler) as httpd:
         httpd.serve_forever()
