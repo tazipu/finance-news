@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-财经新闻聚合系统 - Render部署版【融合东方财富/同花顺/华尔街见闻/36氪/新浪】
-数据源：东方财富、36氪RSS、新浪RSS、证券时报、同花顺、华尔街见闻
-适配Render云平台部署
+财经新闻聚合系统 - 多环境适配版【本地/QPython/Render】
+数据源：36氪RSS、新浪RSS、证券时报、同花顺、华尔街见闻
 """
 import datetime
 import hashlib
@@ -10,7 +9,6 @@ import json
 import os
 import time
 import logging
-import random
 import re
 import threading
 from typing import List, Dict, Optional
@@ -21,13 +19,36 @@ import socketserver
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ==================== 环境检测 ====================
+def detect_environment():
+    """检测运行环境"""
+    if os.environ.get('RENDER'):
+        return 'render'
+    elif os.path.exists('/data/user/0/org.qpython.qpy'):
+        return 'qpython'
+    else:
+        return 'local'
+
+ENV = detect_environment()
+IS_RENDER = ENV == 'render'
+IS_QPTHON = ENV == 'qpython'
+IS_LOCAL = ENV == 'local'
+
 # ==================== 日志配置 ====================
-logging.basicConfig(level=logging.INFO)
+if IS_QPTHON:
+    logging.basicConfig(level=logging.WARNING)
+else:
+    logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==================== 全局请求配置 ====================
 PORT = int(os.environ.get("PORT", 5000))
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+if IS_QPTHON:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 CACHE_FILE = os.path.join(SCRIPT_DIR, "news_cache.json")
 
 MAX_NEWS = 300
@@ -36,11 +57,116 @@ CACHE_EXPIRE_DAYS = 3
 AUTO_CLEAN_INTERVAL = 7200
 COMMON_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+# ==================== 文本处理辅助函数 ====================
+
+def get_first_paragraph(text: str, max_length: int = 350) -> str:
+    """
+    抓取标题下方首段文字，在句号、感叹号、问号处结束，不以无符号断开
+    """
+    if not text:
+        return ''
+    
+    # 清理HTML标签
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    if not text:
+        return ''
+    
+    # 句末标点（句号/感叹号/问号，含半角）
+    end_chars = '。！？!?'
+    # 句中停顿标点（无句末标点时，退到此并补句号）
+    mid_chars = '，,、；;'
+    
+    # 先按换行符分割获取第一段
+    paragraphs = re.split(r'\n+', text)
+    first_para = paragraphs[0].strip() if paragraphs else text
+    
+    # 如果第一段太短（少于20个字符），尝试合并下一段
+    if len(first_para) < 20 and len(paragraphs) > 1:
+        first_para = first_para + ' ' + paragraphs[1].strip()
+    
+    if not first_para:
+        return ''
+    
+    def cut_at_ending(s: str) -> str:
+        """找到第一个句末标点并返回其前缀（含标点）"""
+        for i, ch in enumerate(s):
+            if ch in end_chars:
+                return s[:i + 1]
+        return ''
+    
+    def close_without_ending(s: str) -> str:
+        """全文无句末标点时，退到最近停顿标点并补句号"""
+        for i in range(len(s) - 1, -1, -1):
+            if s[i] in mid_chars:
+                return s[:i + 1] + '。'
+        return s + '。'
+    
+    # 1) 段内在限制范围内找到第一个句末标点 → 直接截取
+    head = cut_at_ending(first_para)
+    if head and len(head) <= max_length:
+        return head
+    
+    # 2) 段长超过限制 → 从限制位置向前找最近的句末标点
+    if len(first_para) > max_length:
+        window = first_para[:max_length]
+        for i in range(len(window) - 1, -1, -1):
+            if window[i] in end_chars:
+                return window[:i + 1]
+        # 3) 限制内无句末标点 → 向后扩展找下一个句末标点
+        tail = first_para[max_length:]
+        if tail:
+            for i, ch in enumerate(tail):
+                if ch in end_chars:
+                    return first_para[:max_length + i + 1]
+        # 4) 全文无句末标点 → 停顿标点处补句号
+        return close_without_ending(window)
+    
+    # 段长在限制内且无句末标点 → 停顿标点处补句号
+    return close_without_ending(first_para)
+
+def clean_html_content(text: str) -> str:
+    """清理HTML标签"""
+    if not text:
+        return ''
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def process_news_content(content: str, title: str = '') -> str:
+    """
+    处理新闻内容：清理HTML、提取第一段完整内容
+    """
+    if not content:
+        return title[:200] if title else ''
+    
+    content = clean_html_content(content)
+    
+    if not content and title:
+        content = title
+    
+    # 如果内容以标题开头，去除标题重复部分
+    if title and content.startswith(title) and len(content) > len(title) + 10:
+        content = content[len(title):].strip()
+        if content and not content[0] in '，。！？、：':
+            content = title + '，' + content
+    
+    # 获取第一段完整内容
+    result = get_first_paragraph(content, 350)
+    
+    # 如果结果为空或太短，使用标题
+    if not result or len(result) < 10:
+        return title[:200] if title else ''
+    
+    return result
+
 # ==================== 新闻存储模块 ====================
 class NewsStorage:
     def __init__(self):
         self.news_list: List[Dict] = []
         self.news_hashes: set = set()
+        self.title_hashes: set = set()  # 用于标题去重
         self.load_cache()
         self.start_auto_clean()
 
@@ -52,25 +178,32 @@ class NewsStorage:
                     if isinstance(data, list):
                         self.news_list = data
                         self.news_hashes = set()
+                        self.title_hashes = set()
                         for news in data:
                             fingerprint = news.get('_fingerprint')
                             if fingerprint:
                                 self.news_hashes.add(fingerprint)
+                            title_hash = self._get_title_hash(news.get('title', ''))
+                            if title_hash:
+                                self.title_hashes.add(title_hash)
                     else:
                         self.news_list = data.get('news', [])
                         self.news_hashes = set(data.get('hashes', []))
+                        self.title_hashes = set(data.get('title_hashes', []))
                 logger.info(f"✅ 加载缓存：{len(self.news_list)}条")
                 self.clean_expired_cache()
             except Exception as e:
                 logger.error(f"❌ 加载缓存失败：{e}")
                 self.news_list = []
                 self.news_hashes = set()
+                self.title_hashes = set()
 
     def save_cache(self):
         try:
             data = {
                 'news': self.news_list[:MAX_NEWS],
                 'hashes': list(self.news_hashes),
+                'title_hashes': list(self.title_hashes),
                 'update_time': datetime.datetime.now().isoformat()
             }
             with open(CACHE_FILE, 'w', encoding='utf-8') as f:
@@ -108,10 +241,14 @@ class NewsStorage:
         if expired_count > 0:
             self.news_list = new_list
             self.news_hashes = set()
+            self.title_hashes = set()
             for news in new_list:
                 fingerprint = news.get('_fingerprint')
                 if fingerprint:
                     self.news_hashes.add(fingerprint)
+                title_hash = self._get_title_hash(news.get('title', ''))
+                if title_hash:
+                    self.title_hashes.add(title_hash)
             logger.info(f"🧹 清理过期缓存：{expired_count}条")
             self.save_cache()
 
@@ -119,6 +256,7 @@ class NewsStorage:
         count = len(self.news_list)
         self.news_list = []
         self.news_hashes = set()
+        self.title_hashes = set()
         if os.path.exists(CACHE_FILE):
             try:
                 os.remove(CACHE_FILE)
@@ -145,6 +283,17 @@ class NewsStorage:
         title = re.sub(r'\s+', ' ', title).strip()
         return title[:50]
 
+    def _get_title_hash(self, title: str) -> str:
+        """生成标题的哈希值用于去重"""
+        if not title:
+            return ''
+        # 清理标题中的特殊字符和数字
+        clean = re.sub(r'[0-9一二三四五六七八九十百千万亿\d]', '', title)
+        clean = re.sub(r'[，。！？、：；""''（）【】\s]', '', clean)
+        if len(clean) < 5:  # 如果清理后太短，使用原始标题
+            clean = title
+        return hashlib.md5(clean.encode('utf-8')).hexdigest()
+
     def _get_fingerprint(self, news_item: Dict) -> str:
         title = news_item.get('title', '').strip()
         title = self._clean_title(title)
@@ -157,11 +306,20 @@ class NewsStorage:
         for item in news_items:
             if not item.get('title'):
                 continue
+            
+            # 检查标题是否重复（去重）
+            title_hash = self._get_title_hash(item.get('title', ''))
+            if title_hash and title_hash in self.title_hashes:
+                continue
+            
             fingerprint = self._get_fingerprint(item)
             if fingerprint not in self.news_hashes:
                 item['_fingerprint'] = fingerprint
+                item['_title_hash'] = title_hash
                 self.news_list.append(item)
                 self.news_hashes.add(fingerprint)
+                if title_hash:
+                    self.title_hashes.add(title_hash)
                 added += 1
         if len(self.news_list) > MAX_NEWS:
             self.news_list = self.news_list[-MAX_NEWS:]
@@ -183,9 +341,21 @@ class NewsStorage:
         
         result = []
         for n in news:
+            content = n.get('content', '')
+            if content.endswith('...'):
+                content = content[:-3]
+            # 展示截断：确保以句末标点结束，不以无符号断开
+            if len(content) > 200:
+                cut = content[:200]
+                pos = -1
+                for i in range(len(cut) - 1, -1, -1):
+                    if cut[i] in '。！？!?':
+                        pos = i
+                        break
+                content = cut[:pos + 1] if pos > 30 else cut
             result.append({
                 'title': n.get('title', ''),
-                'content': n.get('content', '')[:80],
+                'content': content,
                 'source': n.get('source', ''),
                 'publish_time': n.get('publish_time', ''),
                 'type': n.get('type', 'all')
@@ -209,138 +379,8 @@ class NewsStorage:
 
 # ==================== 数据源 ====================
 
-def fetch_eastmoney():
-    """东方财富快讯"""
-    news_list = []
-    try:
-        # 东方财富财经快讯API
-        url = "https://news.eastmoney.com/kuaixun/"
-        headers = {
-            'User-Agent': COMMON_UA,
-            'Referer': 'https://news.eastmoney.com/'
-        }
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.encoding = 'utf-8'
-        
-        # 解析HTML提取新闻
-        html = resp.text
-        # 匹配新闻项
-        pattern = r'<li[^>]*class="newsItem"[^>]*>.*?<a[^>]*href="([^"]*)"[^>]*>([^<]*)</a>.*?<span[^>]*class="time"[^>]*>([^<]*)</span>.*?</li>'
-        matches = re.findall(pattern, html, re.DOTALL)
-        
-        if not matches:
-            # 备用匹配模式
-            pattern2 = r'<li[^>]*>.*?<a[^>]*href="([^"]*)"[^>]*>([^<]*)</a>.*?<span[^>]*>(\d{2}:\d{2})</span>.*?</li>'
-            matches = re.findall(pattern2, html, re.DOTALL)
-        
-        for match in matches[:20]:
-            url_link = match[0] if len(match) > 0 else ''
-            title = match[1] if len(match) > 1 else ''
-            time_str = match[2] if len(match) > 2 else ''
-            
-            if not title or len(title) < 3:
-                continue
-            
-            # 清理标题
-            title = re.sub(r'<[^>]+>', '', title).strip()
-            
-            # 处理时间
-            now = datetime.datetime.now()
-            if time_str:
-                if ':' in time_str:
-                    try:
-                        if len(time_str) == 5:  # HH:MM
-                            pub_time = f"{now.strftime('%Y-%m-%d')} {time_str}:00"
-                            dt = datetime.datetime.strptime(pub_time, "%Y-%m-%d %H:%M:%S")
-                            # 如果时间大于当前时间，减一天
-                            if dt > now:
-                                dt = dt - datetime.timedelta(days=1)
-                            pub_time = dt.strftime("%Y-%m-%d %H:%M")
-                        else:
-                            pub_time = time_str
-                    except:
-                        pub_time = now.strftime("%Y-%m-%d %H:%M")
-                else:
-                    pub_time = now.strftime("%Y-%m-%d %H:%M")
-            else:
-                pub_time = now.strftime("%Y-%m-%d %H:%M")
-            
-            news_list.append({
-                'title': title,
-                'content': title[:150],
-                'source': '东方财富',
-                'publish_time': pub_time,
-                'type': classify_news(title),
-                'url': f"https://news.eastmoney.com{url_link}" if url_link.startswith('/') else url_link
-            })
-        
-        logger.info(f"✅ 东方财富：{len(news_list)}条")
-        
-        # 如果没抓到数据，使用备用接口
-        if len(news_list) == 0:
-            logger.info("🔄 东方财富备用接口...")
-            url2 = "https://news.eastmoney.com/api/news/get"
-            params = {
-                "page": 1,
-                "size": 20,
-                "type": "kuaixun"
-            }
-            headers2 = {
-                'User-Agent': COMMON_UA,
-                'Referer': 'https://news.eastmoney.com/'
-            }
-            resp2 = requests.get(url2, params=params, headers=headers2, timeout=REQUEST_TIMEOUT)
-            data = resp2.json()
-            if data.get('code') == 0:
-                for item in data.get('data', {}).get('list', []):
-                    title = item.get('title', '')
-                    if not title:
-                        continue
-                    pub_time = item.get('time', datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
-                    news_list.append({
-                        'title': title,
-                        'content': item.get('summary', title)[:150],
-                        'source': '东方财富',
-                        'publish_time': pub_time,
-                        'type': classify_news(title),
-                        'url': item.get('url', '')
-                    })
-                logger.info(f"✅ 东方财富(备用)：{len(news_list)}条")
-                
-    except Exception as e:
-        logger.error(f"❌ 东方财富抓取失败: {str(e)}")
-        # 返回模拟数据
-        mock_data = [
-            {
-                "title": "📊 东方财富：A股三大指数集体高开，北向资金净流入",
-                "content": "A股三大指数集体高开，北向资金早盘净流入超20亿元。",
-                "source": "东方财富",
-                "publish_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "type": "stock",
-                "url": ""
-            },
-            {
-                "title": "📈 东方财富：券商板块异动拉升，政策利好持续释放",
-                "content": "券商板块午后异动拉升，多家券商发布研报看好后市。",
-                "source": "东方财富",
-                "publish_time": (datetime.datetime.now() - datetime.timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M"),
-                "type": "stock",
-                "url": ""
-            },
-            {
-                "title": "💰 东方财富：新能源赛道持续升温，产业链订单饱满",
-                "content": "新能源板块持续走强，产业链上下游订单饱满，景气度提升。",
-                "source": "东方财富",
-                "publish_time": (datetime.datetime.now() - datetime.timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M"),
-                "type": "stock",
-                "url": ""
-            }
-        ]
-        logger.info(f"✅ 东方财富(模拟)：{len(mock_data)}条")
-        return mock_data
-    return news_list
-
 def fetch_36kr_rss():
+    """36氪RSS"""
     news_list = []
     try:
         import xml.etree.ElementTree as ET
@@ -365,9 +405,10 @@ def fetch_36kr_rss():
                 except:
                     pass
             desc = item.find('description')
-            content = desc.text if desc is not None else ''
-            if content:
-                content = re.sub(r'<[^>]+>', '', content)[:150]
+            content_raw = desc.text if desc is not None else ''
+            
+            content = process_news_content(content_raw, title)
+            
             news_list.append({
                 'title': title,
                 'content': content,
@@ -382,6 +423,7 @@ def fetch_36kr_rss():
     return news_list
 
 def fetch_sina_rss():
+    """新浪RSS"""
     news_list = []
     try:
         import xml.etree.ElementTree as ET
@@ -406,9 +448,10 @@ def fetch_sina_rss():
                 except:
                     pass
             desc = item.find('description')
-            content = desc.text if desc is not None else ''
-            if content:
-                content = re.sub(r'<[^>]+>', '', content)[:150]
+            content_raw = desc.text if desc is not None else ''
+            
+            content = process_news_content(content_raw, title)
+            
             news_list.append({
                 'title': title,
                 'content': content,
@@ -443,7 +486,10 @@ def fetch_stcn():
             title = item.get("title", "")
             if not title:
                 continue
-            content = item.get("content", title)[:150]
+            content_raw = item.get("content", title)
+            
+            content = process_news_content(content_raw, title)
+            
             ms_ts = item.get("time", int(time.time()*1000))
             pub_dt = datetime.datetime.fromtimestamp(ms_ts / 1000)
             pub_time = pub_dt.strftime("%Y-%m-%d %H:%M")
@@ -478,7 +524,10 @@ def fetch_ths():
             title = item.get("title", "")
             if not title:
                 continue
-            content = item.get("digest", title)[:150]
+            content_raw = item.get("digest", title)
+            
+            content = process_news_content(content_raw, title)
+            
             unix_ts = int(item.get("ctime", time.time()))
             pub_dt = datetime.datetime.fromtimestamp(unix_ts)
             pub_time = pub_dt.strftime("%Y-%m-%d %H:%M")
@@ -492,7 +541,7 @@ def fetch_ths():
             })
         logger.info(f"✅ 同花顺：{len(news_list)}条")
     except Exception as e:
-        logger.error(f"❌ 同花顺抓取失败(反爬较强): {str(e)}")
+        logger.error(f"❌ 同花顺抓取失败: {str(e)}")
     return news_list
 
 def fetch_wscn():
@@ -515,7 +564,10 @@ def fetch_wscn():
             title = item.get("title", "")
             if not title:
                 continue
-            content = item.get("content_text", title)[:150]
+            content_raw = item.get("content_text", title)
+            
+            content = process_news_content(content_raw, title)
+            
             unix_ts = int(item.get("display_time", time.time()))
             pub_dt = datetime.datetime.fromtimestamp(unix_ts)
             pub_time = pub_dt.strftime("%Y-%m-%d %H:%M")
@@ -532,34 +584,7 @@ def fetch_wscn():
         logger.error(f"❌ 华尔街见闻抓取失败: {str(e)}")
     return news_list
 
-# ==================== 模拟数据、分类、统一抓取入口 ====================
-def generate_mock_news(count=10):
-    news_list = []
-    now = datetime.datetime.now()
-    mock_templates = [
-        {'title': '📊 北向资金净流入超50亿元，连续3日加仓', 'content': '北向资金今日净流入超50亿元，外资持续看好A股。', 'type': 'stock'},
-        {'title': '🏦 央行降准0.25%，释放长期资金5000亿元', 'content': '央行下调存款准备金率0.25个百分点。', 'type': 'stock'},
-        {'title': '📈 A股三大指数收涨，成交额突破万亿', 'content': '沪指涨0.8%报3280点，深成指涨1.2%。', 'type': 'stock'},
-        {'title': '📝 百家公司发布业绩预告，七成预增', 'content': '超百家上市公司发布业绩预告，约70%预增。', 'type': 'company'},
-        {'title': '💹 券商板块大涨，政策利好频出', 'content': '证监会发布支持政策，券商板块涨幅居前。', 'type': 'stock'},
-        {'title': '🌍 美联储加息25基点，美股收涨', 'content': '美联储加息符合预期，美股三大指数上涨。', 'type': 'stock'},
-        {'title': '💰 新能源板块走强，产业链景气提升', 'content': '锂电池、光伏等新能源涨幅居前。', 'type': 'stock'},
-        {'title': '📈 半导体板块走强，国产替代加速', 'content': '半导体板块表现强势，多只个股涨停。', 'type': 'tech'},
-        {'title': '🏭 制造业PMI连续3个月回升，经济复苏信号明确', 'content': '制造业采购经理指数连续3个月回升。', 'type': 'company'},
-        {'title': '💻 AI大模型应用加速落地，相关公司业绩爆发', 'content': 'AI大模型在各行业加速应用，相关公司业绩爆发式增长。', 'type': 'tech'},
-    ]
-    selected = random.sample(mock_templates, min(count, len(mock_templates)))
-    for i, item in enumerate(selected):
-        news_list.append({
-            'title': item['title'],
-            'content': item['content'],
-            'source': '综合资讯',
-            'publish_time': (now - datetime.timedelta(minutes=i*8)).strftime("%Y-%m-%d %H:%M"),
-            'type': item['type'],
-            'url': ''
-        })
-    logger.info(f"✅ 生成 {len(news_list)} 条模拟数据")
-    return news_list
+# ==================== 分类和统一抓取入口 ====================
 
 def classify_news(title):
     text = title.lower()
@@ -574,9 +599,8 @@ def classify_news(title):
     return 'all'
 
 def fetch_all_news():
-    """并发抓取全部6个数据源"""
+    """并发抓取全部5个数据源"""
     source_tasks = [
-        ("东方财富", fetch_eastmoney),
         ("36氪", fetch_36kr_rss),
         ("新浪RSS", fetch_sina_rss),
         ("证券时报", fetch_stcn),
@@ -586,7 +610,7 @@ def fetch_all_news():
     all_news = []
     success_count = 0
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         task_map = {executor.submit(func): name for name, func in source_tasks}
         for future in as_completed(task_map):
             src_name = task_map[future]
@@ -599,10 +623,10 @@ def fetch_all_news():
                 logger.error(f"❌ {src_name} 线程异常: {e}")
 
     logger.info(f"✅ 成功 {success_count}/{len(source_tasks)} 个数据源")
-    if len(all_news) < 15:
-        logger.info(f"📝 新闻数量不足，补充模拟资讯")
-        mock_news = generate_mock_news(10)
-        all_news.extend(mock_news)
+    
+    if not all_news:
+        logger.warning("⚠️ 所有数据源都抓取失败，返回空列表")
+    
     return all_news
 
 # ==================== HTML页面 ====================
@@ -672,33 +696,34 @@ HTML_TEMPLATE = """
             transition: all 0.2s;
             display: flex;
             flex-direction: column;
-            min-height: 80px;
+            min-height: 90px;
         }
         .news-item:hover { background: #f8f9ff; transform: translateY(-1px); box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
         .news-item .title { 
             font-size: 14px; 
             font-weight: 600; 
-            margin-bottom: 4px;
-            line-height: 1.4;
+            margin-bottom: 6px;
+            line-height: 1.5;
             display: -webkit-box;
             -webkit-line-clamp: 2;
             -webkit-box-orient: vertical;
             overflow: hidden;
         }
         .news-item .content-preview { 
-            font-size: 12px; 
-            color: #888; 
+            font-size: 13px; 
+            color: #555; 
+            line-height: 1.6;
             display: -webkit-box;
-            -webkit-line-clamp: 1;
+            -webkit-line-clamp: 3;
             -webkit-box-orient: vertical;
             overflow: hidden;
             flex: 1;
-            margin-bottom: 4px;
+            margin-bottom: 6px;
         }
         .news-item .content-full {
             font-size: 13px;
             color: #333;
-            line-height: 1.6;
+            line-height: 1.8;
             display: none;
             padding-top: 8px;
             border-top: 1px solid #eee;
@@ -719,6 +744,7 @@ HTML_TEMPLATE = """
             align-items: center;
         }
         .news-item .expand-btn { font-size: 11px; color: #667eea; user-select: none; }
+        .news-item .expand-btn:hover { color: #764ba2; }
         .tag { background: #eee; padding: 1px 8px; border-radius: 10px; font-size: 9px; }
         .tag.stock { background: #d1fae5; color: #059669; }
         .tag.company { background: #ede9fe; color: #7c3aed; }
@@ -754,7 +780,7 @@ HTML_TEMPLATE = """
             background: #f0f0f0;
             color: #666;
         }
-        .render-badge {
+        .env-badge {
             display: inline-block;
             background: rgba(255,255,255,0.2);
             padding: 2px 10px;
@@ -769,8 +795,8 @@ HTML_TEMPLATE = """
     <div class="header">
         <h1>📈 财经科技新闻聚合</h1>
         <div class="stats">共 <span id="count">0</span> 条 <span class="update-time" id="updateTime"></span></div>
-        <div class="api-info">📰 东方财富 + 36氪 + 新浪RSS + 证券时报 + 同花顺 + 华尔街见闻</div>
-        <div class="render-badge">🚀 Deployed on Render</div>
+        <div class="api-info">📰 36氪 + 新浪RSS + 证券时报 + 同花顺 + 华尔街见闻</div>
+        <div class="env-badge" id="envBadge">🚀 加载中...</div>
     </div>
     
     <div class="filters-wrapper">
@@ -792,6 +818,17 @@ HTML_TEMPLATE = """
     <script>
         let currentType = 'all';
         let expandedId = null;
+        
+        async function detectEnv() {
+            try {
+                const resp = await fetch('/api/env');
+                const data = await resp.json();
+                document.getElementById('envBadge').textContent = '🚀 ' + data.env;
+            } catch(e) {
+                document.getElementById('envBadge').textContent = '🚀 本地运行';
+            }
+        }
+        detectEnv();
         
         function showToast(msg) {
             const toast = document.getElementById('toast');
@@ -836,7 +873,7 @@ HTML_TEMPLATE = """
                 const resp = await fetch(`/api/news?type=${type}`);
                 const news = await resp.json();
                 if (!news || news.length === 0) {
-                    container.innerHTML = '<div class="loading">暂无新闻</div>';
+                    container.innerHTML = '<div class="loading">暂无新闻<br><small>请点击"刷新"按钮手动抓取</small></div>';
                     return;
                 }
                 document.getElementById('count').textContent = news.length;
@@ -927,7 +964,6 @@ HTML_TEMPLATE = """
         });
         
         loadNews('all');
-        // 30分钟自动刷新
         setInterval(refresh, 1800000);
     </script>
 </body>
@@ -965,8 +1001,10 @@ class HttpHandler(BaseHTTPRequestHandler):
                 self._send_json(data)
             elif path == '/api/stats':
                 self._send_json(storage.get_stats())
+            elif path == '/api/env':
+                self._send_json({"env": ENV.upper(), "render": IS_RENDER, "qpython": IS_QPTHON})
             elif path == '/api/health':
-                self._send_json({"status": "ok", "time": datetime.datetime.now().isoformat()})
+                self._send_json({"status": "ok", "time": datetime.datetime.now().isoformat(), "env": ENV})
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1000,26 +1038,54 @@ class HttpHandler(BaseHTTPRequestHandler):
 
 # ==================== 启动入口 ====================
 if __name__ == '__main__':
-    # 初始化存储并首次抓取
     storage = NewsStorage()
-    logger.info("🔄 初始全量抓取6大财经资讯源...")
-    news = fetch_all_news()
-    added = storage.add_news(news)
-    logger.info(f"✅ 本次新增 {added} 条，缓存共 {storage.get_stats()['total']} 条新闻")
+    
+    env_names = {
+        'render': '☁️ Render云平台',
+        'qpython': '📱 QPython手机端',
+        'local': '💻 本地电脑'
+    }
     
     print("=" * 65)
-    print("📈 财经科技新闻聚合服务（Render部署版）")
-    print("📊 数据源：东方财富、36氪、新浪RSS、证券时报、同花顺、华尔街见闻")
+    print(f"📈 财经科技新闻聚合服务 ({env_names.get(ENV, ENV)})")
+    print("📊 数据源：36氪、新浪RSS、证券时报、同花顺、华尔街见闻")
     print(f"🌐 服务端口: {PORT}")
+    print(f"📁 缓存路径: {CACHE_FILE}")
     print("=" * 65)
     
     stats = storage.get_stats()
-    print(f"\n📊 当前新闻统计：")
-    print(f"  • 总条数：{stats['total']} 条")
-    print(f"  • 分类数量：{stats['by_type']}")
-    print(f"  • 各来源条数：{stats['by_source']}")
+    if stats['total'] > 0:
+        print(f"📊 使用缓存数据：{stats['total']} 条新闻")
+        print(f"  • 分类数量：{stats['by_type']}")
+        print(f"  • 各来源条数：{stats['by_source']}")
+    else:
+        print("🔄 首次运行，抓取新闻...")
+        news = fetch_all_news()
+        if news:
+            added = storage.add_news(news)
+            logger.info(f"✅ 本次新增 {added} 条")
+            stats = storage.get_stats()
+            print(f"\n📊 当前新闻统计：")
+            print(f"  • 总条数：{stats['total']} 条")
+            print(f"  • 分类数量：{stats['by_type']}")
+            print(f"  • 各来源条数：{stats['by_source']}")
+        else:
+            print("⚠️ 所有数据源抓取失败，请检查网络连接")
+    
     print("\n" + "=" * 65)
-    print("✅ 服务启动完成")
+    
+    if IS_QPTHON:
+        print("📱 QPython环境访问地址：")
+        print("  • http://127.0.0.1:5000")
+        print("  • http://localhost:5000")
+        print("  • 在手机浏览器输入上述地址访问")
+    elif IS_RENDER:
+        print("☁️ Render部署完成，等待外部访问...")
+    else:
+        print("💻 本地访问地址：http://127.0.0.1:5000")
+    
+    print("✅ 服务启动完成，Ctrl+C 终止服务")
+    print("=" * 65)
 
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), HttpHandler) as httpd:
